@@ -1,0 +1,408 @@
+#!/usr/bin/env python
+
+
+import rospy
+import actionlib
+import time
+import math
+import thread
+import numpy as np
+
+import roslib
+roslib.load_manifest('robotiq_2f_gripper_control')
+
+from robotiq_2f_gripper_control.msg import Robotiq2FGripper_robot_output as outputMsg
+from robotiq_2f_gripper_control.msg import Robotiq2FGripper_robot_input as inputMsg
+
+from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryGoal
+from sensor_msgs.msg import JointState
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+Q0 = [0, 0, 0, 0, 0, 0]
+Q1 = [1.124, 0, 0, 0, -1.55, 0]
+Q2 = [1.124, 0.2, -0.3, 0, -0.6, 0]
+Q3 = [1.124, 0.27, -0.51, 0, -0.6, 0.015]
+Q4 = [1.124, 0.24, -0.51, 0, -0.62, 0.015]
+Q5 = [0, 0, 0, 0, -1.55, 1.6] 
+Q6 = [-0.0013, 0.0266, -0.44, 0, -1.009, 1.56]
+#Q6 = [-0.005, 0.030, -0.43, 0, -1.031, 1.6] 
+Q7 = [-0.005, 0.03, -0.2, 0, -1.031, 0]    
+Q8 = [-0.005, 0.08, -0.42, 0, -1.02, 0] 
+Q9 = [-0.005, 0.08, -0.38, 0, -1.09, 0] 
+Q10 = [-0.005, 0, 0, 0, -1.55, 0]
+Q11 = [-0.9, 0, 0, 0, -1.55, 0]
+Q12 = [-0.905, 0.35, -0.1, 0, -1.1, 0] 
+#[-0.905, 0.35, -0.2, 0, -0.9, 0]
+#[-0.905, 0.5, -0.13, 0, -0.9, -0.15] 
+Q13 = [-0.91, 0.525, -0.117, -0.003, -0.877, -0.39] 
+#Q13 = [-0.905, 0.444, -0.24, 0, -0.7, -0.31] 
+#Q12 = [-0.905, 0.43, -0.25, 0, -0.73, 1.18] 
+#Q13 = [-0.907, 0.442, -0.245, 0, -0.685, 1.21]   
+Q14 = [-0.9, 0.3, -0.3, 0, -0.8, 0] 
+
+#Q15 = [-0.905, 0.43, -0.25, 0, -0.685, 1.18] 
+#Q16 = [0, 0, 0, 0, -1.55, 0]  
+#Q17 = [-0.001, 0.030, -0.43, 0, -1.031, 0]
+
+
+class RobotiqCGripper(object):
+    def __init__(self):
+        self.cur_status = None
+        self.status_sub = rospy.Subscriber('Robotiq2FGripperRobotInput', inputMsg,
+                                           self._status_cb)
+        self.cmd_pub = rospy.Publisher('Robotiq2FGripperRobotOutput', outputMsg)
+
+    def _status_cb(self, msg):
+        self.cur_status = msg
+
+    def wait_for_connection(self, timeout=-1):
+        rospy.sleep(0.1)
+        r = rospy.Rate(30)
+        start_time = rospy.get_time()
+        while not rospy.is_shutdown():
+            if (timeout >= 0. and rospy.get_time() - start_time > timeout):
+                return False
+            if self.cur_status is not None:
+                return True
+            r.sleep()
+        return False
+
+    def is_ready(self):
+        return self.cur_status.gSTA == 3 and self.cur_status.gACT == 1
+
+    def is_reset(self):
+        return self.cur_status.gSTA == 0 or self.cur_status.gACT == 0
+
+    def is_moving(self):
+        return self.cur_status.gGTO == 1 and self.cur_status.gOBJ == 0
+
+    def is_stopped(self):
+        return self.cur_status.gOBJ != 0
+
+    def object_detected(self):
+        return self.cur_status.gOBJ == 1 or self.cur_status.gOBJ == 2
+
+    def get_fault_status(self):
+        return self.cur_status.gFLT
+
+    def get_pos(self):
+        po = self.cur_status.gPO
+        return np.clip(0.087/(13.-230.)*(po-230.), 0, 0.087)
+
+    def get_req_pos(self):
+        pr = self.cur_status.gPR
+        return np.clip(0.087/(13.-230.)*(pr-230.), 0, 0.087)
+
+    def is_closed(self):
+        return self.cur_status.gPO >= 170
+
+    def is_opened(self):
+        return self.cur_status.gPO <= 13
+
+    def get_current(self):
+        return self.cur_status.gCU * 0.1
+
+    def wait_until_stopped(self, timeout=-1):
+        r = rospy.Rate(30)
+        start_time = rospy.get_time()
+        while not rospy.is_shutdown():
+            if (timeout >= 0. and rospy.get_time() - start_time > timeout) or self.is_reset():
+                return False
+            if self.is_stopped():
+                return True
+            r.sleep()
+        return False
+
+    def wait_until_moving(self, timeout=-1):
+        r = rospy.Rate(30)
+        start_time = rospy.get_time()
+        while not rospy.is_shutdown():
+            if (timeout >= 0. and rospy.get_time() - start_time > timeout) or self.is_reset():
+                return False
+            if not self.is_stopped():
+                return True
+            r.sleep()
+        return False
+
+    def reset(self):
+        cmd = outputMsg()
+        cmd.rACT = 0
+        self.cmd_pub.publish(cmd)
+
+    def activate(self, timeout=-1):
+        cmd = outputMsg()
+        cmd.rACT = 1
+        cmd.rGTO = 1
+        cmd.rPR = 0
+        cmd.rSP = 255
+        cmd.rFR = 150
+        self.cmd_pub.publish(cmd)
+        r = rospy.Rate(30)
+        start_time = rospy.get_time()
+        while not rospy.is_shutdown():
+            if timeout >= 0. and rospy.get_time() - start_time > timeout:
+                return False
+            if self.is_ready():
+                return True
+            r.sleep()
+        return False
+
+    def auto_release(self):
+        cmd = outputMsg()
+        cmd.rACT = 1
+        cmd.rATR = 1
+        self.cmd_pub.publish(cmd)
+
+    def goto(self, pos, vel, force, block=False, timeout=-1):
+        cmd = outputMsg()
+        cmd.rACT = 1
+        cmd.rGTO = 1
+        cmd.rPR = int(np.clip((13.-230.)/0.087 * pos + 230., 0, 255))
+        cmd.rSP = int(np.clip(255./(0.1-0.013) * (vel-0.013), 0, 255))
+        cmd.rFR = int(np.clip(255./(100.-30.) * (force-30.), 0, 255))
+        self.cmd_pub.publish(cmd)
+        rospy.sleep(0.1)
+        if block:
+            if not self.wait_until_moving(timeout):
+                return False
+            return self.wait_until_stopped(timeout)
+        return True
+
+    def stop(self, block=False, timeout=-1):
+        cmd = outputMsg()
+        cmd.rACT = 1
+        cmd.rGTO = 0
+        self.cmd_pub.publish(cmd)
+        rospy.sleep(0.1)
+        if block:
+            return self.wait_until_stopped(timeout)
+        return True
+
+    def open(self, vel=0.1, force=100, block=False, timeout=-1):
+        if self.is_opened():
+            return True
+        return self.goto(1.0, vel, force, block=block, timeout=timeout)
+
+    def close(self, vel=0.1, force=100, block=False, timeout=-1):
+        if self.is_closed():
+            return True
+        return self.goto(-1.0, vel, force, block=block, timeout=timeout)
+
+
+
+def main():
+    rospy.init_node('simple_trajectory_action_client', 'robotiq_2f_gripper_ctrl_test')
+
+    client = actionlib.SimpleActionClient('joint_trajectory_action', FollowJointTrajectoryAction)
+    rospy.loginfo('Waiting for driver\'s action server to become available ..')
+    client.wait_for_server()
+    rospy.loginfo('Connected to trajectory action server')
+
+    goal = FollowJointTrajectoryGoal()
+    goal.trajectory = JointTrajectory()
+
+    goal.trajectory.joint_names = ['joint_s', 'joint_l', 'joint_u', 'joint_r', 'joint_b', 'joint_t']
+
+    robot_joint_states = rospy.wait_for_message('joint_states', JointState)
+
+    if set(goal.trajectory.joint_names) != set(robot_joint_states.name):
+        rospy.logfatal("Mismatch between joints specified and seen in current "
+            "JointState. Expected: '{}', got: '{}'. Cannot continue.".format(
+                ', '.join(robot_joint_states.name),
+                ', '.join(goal.trajectory.joint_names)))
+        sys.exit(1)
+
+
+    q0 = robot_joint_states.position
+    q1 = list(q0)
+    q2 = list(q0)
+    q3 = list(q0)
+    q4 = list(q0)
+    q5 = list(q0)
+   
+
+    # Assume the last joint is T
+    q1[-6] += math.radians(60)
+    q2[-5] += math.radians(10)
+    #q3[-6] += math.radians(10)
+    q4[-6] -= math.radians(10)
+    q5[-3] += math.radians(10)
+   
+
+    qdot = [0.0] * len(goal.trajectory.joint_names)
+
+
+
+    try:
+         joint_states = rospy.wait_for_message("joint_states", JointState)
+         joints_pos = joint_states.position
+         goal.trajectory.points = [
+             JointTrajectoryPoint(positions=joints_pos, velocities=[0]*6, time_from_start=rospy.Duration(0.0)),
+             JointTrajectoryPoint(positions=Q1, velocities=[0]*6, time_from_start=rospy.Duration(10.0)),
+             JointTrajectoryPoint(positions=Q2, velocities=[0]*6, time_from_start=rospy.Duration(15.0)),
+             JointTrajectoryPoint(positions=Q3, velocities=[0]*6, time_from_start=rospy.Duration(20.0))]
+
+         client.send_goal(goal)
+         client.wait_for_result()
+    except KeyboardInterrupt:
+        client.cancel_goal()
+        raise
+    except:
+        raise
+
+
+    gripper = RobotiqCGripper()
+    gripper.wait_for_connection()
+    rospy.sleep(2)
+    gripper.close()
+    rospy.sleep(2)
+#    gripper.open()
+
+
+    try:
+         joint_states = rospy.wait_for_message("joint_states", JointState)
+         joints_pos = joint_states.position
+         goal.trajectory.points = [
+             JointTrajectoryPoint(positions=joints_pos, velocities=[0]*6, time_from_start=rospy.Duration(30.0)),
+             JointTrajectoryPoint(positions=Q4, velocities=[0]*6, time_from_start=rospy.Duration(45.0)),
+             JointTrajectoryPoint(positions=Q1, velocities=[0]*6, time_from_start=rospy.Duration(55.0)),
+             JointTrajectoryPoint(positions=Q5, velocities=[0]*6, time_from_start=rospy.Duration(65.0)),
+             JointTrajectoryPoint(positions=Q6, velocities=[0]*6, time_from_start=rospy.Duration(75.0))]
+
+         client.send_goal(goal)
+         client.wait_for_result()
+    except KeyboardInterrupt:
+        client.cancel_goal()
+        raise
+    except:
+        raise
+
+    rospy.sleep(1)
+    gripper.open()
+    rospy.sleep(2)
+
+
+    try:
+         joint_states = rospy.wait_for_message("joint_states", JointState)
+         joints_pos = joint_states.position
+         goal.trajectory.points = [
+             JointTrajectoryPoint(positions=joints_pos, velocities=[0]*6, time_from_start=rospy.Duration(77.0)),
+             JointTrajectoryPoint(positions=Q7, velocities=[0]*6, time_from_start=rospy.Duration(80.0)),
+             JointTrajectoryPoint(positions=Q8, velocities=[0]*6, time_from_start=rospy.Duration(85.0))]
+
+         client.send_goal(goal)
+         client.wait_for_result()
+    except KeyboardInterrupt:
+        client.cancel_goal()
+        raise
+    except:
+        raise
+
+    rospy.sleep(1)
+    gripper.close()
+    rospy.sleep(2)
+
+    try:
+         joint_states = rospy.wait_for_message("joint_states", JointState)
+         joints_pos = joint_states.position
+         goal.trajectory.points = [
+             JointTrajectoryPoint(positions=joints_pos, velocities=[0]*6, time_from_start=rospy.Duration(87.0)),
+             JointTrajectoryPoint(positions=Q9, velocities=[0]*6, time_from_start=rospy.Duration(92.0)),
+             JointTrajectoryPoint(positions=Q10, velocities=[0]*6, time_from_start=rospy.Duration(97.0)),
+             JointTrajectoryPoint(positions=Q11, velocities=[0]*6, time_from_start=rospy.Duration(104.0)),
+             JointTrajectoryPoint(positions=Q12, velocities=[0]*6, time_from_start=rospy.Duration(110.0)),
+             JointTrajectoryPoint(positions=Q13, velocities=[0]*6, time_from_start=rospy.Duration(120.0))]
+
+         client.send_goal(goal)
+         client.wait_for_result()
+    except KeyboardInterrupt:
+        client.cancel_goal()
+        raise
+    except:
+        raise
+
+    rospy.sleep(1)
+    gripper.open()
+    rospy.sleep(2)
+
+    try:
+         joint_states = rospy.wait_for_message("joint_states", JointState)
+         joints_pos = joint_states.position
+         goal.trajectory.points = [
+             JointTrajectoryPoint(positions=joints_pos, velocities=[0]*6, time_from_start=rospy.Duration(125.0)),
+             JointTrajectoryPoint(positions=Q14, velocities=[0]*6, time_from_start=rospy.Duration(132.0))]
+
+         client.send_goal(goal)
+         client.wait_for_result()
+    except KeyboardInterrupt:
+        client.cancel_goal()
+        raise
+    except:
+        raise
+
+
+#move_repeated
+    #try:
+        #joint_states = rospy.wait_for_message("joint_states", JointState)
+        #joints_pos = joint_states.position
+        #d = 5.0
+        #goal.trajectory.points = [JointTrajectoryPoint(positions=joints_pos, velocities=[0]*6, time_from_start=rospy.Duration(0.0))]
+ 
+        #for i in range(10):
+            #goal.trajectory.points.append(
+                #JointTrajectoryPoint(positions=Q1, velocities=[0]*6, time_from_start=rospy.Duration(d)))            
+            #d += 4
+            #goal.trajectory.points.append(
+                #JointTrajectoryPoint(positions=Q2, velocities=[0]*6, time_from_start=rospy.Duration(d)))
+            #d += 1
+            #goal.trajectory.points.append(
+                #JointTrajectoryPoint(positions=Q3, velocities=[0]*6, time_from_start=rospy.Duration(d)))
+            #d += 1
+            
+        #client.send_goal(goal)
+        #client.wait_for_result()
+    #except KeyboardInterrupt:
+        #client.cancel_goal()
+        #raise
+    #except:
+        #raise
+
+#move_repeated_kodu_bitisi
+
+
+
+
+
+    #for positions in goal.trajectory.points:
+	
+    #goal.trajectory.points.append(JointTrajectoryPoint(positions=q0, velocities=qdot, time_from_start=rospy.Duration( 0.0)))
+
+    #goal.trajectory.points.append(JointTrajectoryPoint(positions=q1, velocities=qdot, time_from_start=rospy.Duration( 5.0)))
+
+        #goal.trajectory.points.append(JointTrajectoryPoint(positions=q2,   		velocities=qdot, time_from_start=rospy.Duration( 15.0)))
+        
+        #if positions in goal.trajectory.points < 3:
+            #break
+
+    #goal.trajectory.points.append(JointTrajectoryPoint(positions=q5,
+        #velocities=qdot, time_from_start=rospy.Duration( 10.0)))
+
+    #goal.trajectory.points.append(JointTrajectoryPoint(positions=q2,
+        #velocities=qdot, time_from_start=rospy.Duration( 15.0)))
+
+    #goal.trajectory.points.append(JointTrajectoryPoint(positions=q1,
+        #velocities=qdot, time_from_start=rospy.Duration( 20.0)))
+
+
+
+    # goal constructed, submit it for execution
+ #   rospy.loginfo("Submitting goal ..")
+  #  client.send_goal(goal)
+   # rospy.loginfo("Waiting for completion ..")
+    #client.wait_for_result()
+    #rospy.loginfo('Done.')
+
+
+if __name__ == '__main__':
+    main()
+
